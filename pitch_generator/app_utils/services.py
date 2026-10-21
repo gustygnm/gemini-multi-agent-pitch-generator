@@ -656,15 +656,203 @@ def tune_prompt_and_skill(
     return result
 
 # [Guidepost — Step 3b: Sensitive PII Data Scrubbing & Redaction]
-# TODO (Step 3b): Implement recursive PII redaction across strings, dicts, and lists before model or telemetry calls:
-#   - `PII_PATTERNS`: ordered regex list matching API secrets (`[REDACTED_SECRET]`), emails (`[REDACTED_EMAIL]`),
-#     credit cards (`[REDACTED_CC]`), SSNs (`[REDACTED_SSN]`), and phone numbers (`[REDACTED_PHONE]`) without
-#     corrupting normal ISO dates (`2026-10-15`) or campaign metrics (`42%`, `350 lumen`).
-#   - `ScrubResult(str)` (or dataclass/str hybrid) exposing `.scrubbed` and `.redaction_count: int` while
-#     supporting substring checks (`"[REDACTED_EMAIL]" in res`).
-#   - `PIIScrubber` class with `.scrub_text(text) -> ScrubResult` and `.scrub_payload(payload) -> ScrubResult`
-#     (deep-copying dicts/lists so caller inputs are never mutated in place), plus module-level helpers
-#     `scrub_pii`, `scrub_text`, and `scrub_payload`.
+PII_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
+    (
+        "secret",
+        re.compile(
+            r"\b(?:Bearer\s+[A-Za-z0-9_\-\.]+|sk-(?:live|test)?[a-zA-Z0-9_\-]{16,}|AIza[A-Za-z0-9_\-]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36})\b"
+        ),
+        "[REDACTED_SECRET]",
+    ),
+    (
+        "credit_card",
+        re.compile(r"\b(?:\d{4}[ -]){3}\d{4}\b|\b\d{16}\b"),
+        "[REDACTED_CC]",
+    ),
+    (
+        "ssn",
+        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+        "[REDACTED_SSN]",
+    ),
+    (
+        "email",
+        re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+        "[REDACTED_EMAIL]",
+    ),
+    (
+        "phone",
+        re.compile(r"(?:\+?1[-. ]?)?(?:\(\d{3}\)|\b\d{3})[-. ]\d{3}[-. ]\d{4}\b"),
+        "[REDACTED_PHONE]",
+    ),
+]
+
+
+class ScrubResult(str):
+    """
+    /**
+     * String subclass encapsulating sanitized text with PII redaction metadata.
+     *
+     * Why: Inherits from str so substring checks ("in res") work transparently, while exposing
+     * .scrubbed and .redaction_count for downstream auditing.
+     */
+    """
+
+    scrubbed: Any
+    redaction_count: int
+
+    def __new__(cls, content: Any, redaction_count: int = 0) -> ScrubResult:
+        """
+        /**
+         * Construct a new ScrubResult instance holding redacted text or data structure.
+         *
+         * Why: Preserves string representation for logging and assertions while attaching metadata.
+         *
+         * @param content Sanitized string or deep-copied container structure.
+         * @param redaction_count Total number of PII tokens replaced during scrubbing.
+         * @return New ScrubResult instance.
+         */
+        """
+        str_repr = content if isinstance(content, str) else str(content if content is not None else "")
+        instance = super().__new__(cls, str_repr)
+        instance.scrubbed = content
+        instance.redaction_count = redaction_count
+        return instance
+
+
+class PIIScrubber:
+    """
+    /**
+     * Deterministic PII redaction engine for scrubbing sensitive customer and credential data.
+     *
+     * Why: Prevents confidential customer records, credentials, and financial identifiers
+     * from leaking into external model calls, BigQuery telemetry, or agent conversation logs.
+     */
+    """
+
+    def __init__(self, patterns: list[tuple[str, re.Pattern[str], str]] | None = None) -> None:
+        """
+        /**
+         * Initialize PIIScrubber with optional custom pattern overrides.
+         *
+         * Why: Allows customizing detection rules per environment or regulatory domain.
+         *
+         * @param patterns Optional list of (category, regex, replacement) tuples.
+         */
+        """
+        self.patterns = patterns or PII_PATTERNS
+
+    def scrub_text(self, text: str | None) -> ScrubResult:
+        """
+        /**
+         * Scrub sensitive PII tokens from a string.
+         *
+         * Why: Enforces deterministic data privacy while preserving marketing copy,
+         * legitimate ISO dates (e.g. 2026-10-15), and numerical metrics (e.g. 42%).
+         *
+         * @param text Input text string to sanitize.
+         * @return ScrubResult containing redacted string and count of redactions.
+         */
+        """
+        if text is None:
+            return ScrubResult(None, 0)
+        if not isinstance(text, str):
+            return ScrubResult(text, 0)
+        if not text or not text.strip():
+            return ScrubResult(text, 0)
+
+        total_redactions = 0
+        current = text
+        for _category, pattern, replacement in self.patterns:
+            current, count = pattern.subn(replacement, current)
+            total_redactions += count
+
+        return ScrubResult(current, total_redactions)
+
+    def scrub_payload(self, payload: Any) -> ScrubResult:
+        """
+        /**
+         * Recursively scrub PII across nested dictionaries, lists, and strings.
+         *
+         * Why: Deep copies all structures to guarantee caller payload immutability
+         * while sanitizing all nested textual fields.
+         *
+         * @param payload Arbitrary Python object, dictionary, list, or primitive.
+         * @return ScrubResult wrapping the sanitized data structure and cumulative redaction count.
+         */
+        """
+        if payload is None:
+            return ScrubResult(None, 0)
+        if isinstance(payload, str):
+            return self.scrub_text(payload)
+        if isinstance(payload, dict):
+            if not payload:
+                return ScrubResult({}, 0)
+            cleaned_dict: dict[str, Any] = {}
+            total_count = 0
+            for k, v in payload.items():
+                res = self.scrub_payload(v)
+                cleaned_dict[k] = res.scrubbed
+                total_count += res.redaction_count
+            return ScrubResult(cleaned_dict, total_count)
+        if isinstance(payload, list):
+            if not payload:
+                return ScrubResult([], 0)
+            cleaned_list: list[Any] = []
+            total_count = 0
+            for item in payload:
+                res = self.scrub_payload(item)
+                cleaned_list.append(res.scrubbed)
+                total_count += res.redaction_count
+            return ScrubResult(cleaned_list, total_count)
+
+        return ScrubResult(payload, 0)
+
+
+_GLOBAL_PII_SCRUBBER = PIIScrubber()
+
+
+def scrub_text(text: str | None) -> ScrubResult:
+    """
+    /**
+     * Module-level helper for scrubbing PII from text.
+     *
+     * Why: Provides a convenient one-line invocation for string sanitization.
+     *
+     * @param text Raw text string.
+     * @return ScrubResult with sanitized text.
+     */
+    """
+    return _GLOBAL_PII_SCRUBBER.scrub_text(text)
+
+
+def scrub_payload(payload: Any) -> ScrubResult:
+    """
+    /**
+     * Module-level helper for scrubbing PII recursively from payloads.
+     *
+     * Why: Provides a convenient one-line invocation for dictionary and payload sanitization.
+     *
+     * @param payload Nested payload data.
+     * @return ScrubResult with sanitized payload.
+     */
+    """
+    return _GLOBAL_PII_SCRUBBER.scrub_payload(payload)
+
+
+def scrub_pii(data: Any) -> ScrubResult:
+    """
+    /**
+     * Polymorphic PII scrubber handling strings, dictionaries, or lists.
+     *
+     * Why: Canonical Step 3b helper used across telemetry and model invocations.
+     *
+     * @param data Text string or structured payload.
+     * @return ScrubResult with sanitized data.
+     */
+    """
+    if isinstance(data, str):
+        return _GLOBAL_PII_SCRUBBER.scrub_text(data)
+    return _GLOBAL_PII_SCRUBBER.scrub_payload(data)
 
 
 class ServiceContainer:

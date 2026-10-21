@@ -66,7 +66,7 @@
         <!-- [Guidepost — Step 3c: Enable the Human-in-the-Loop Verification Checkbox]
              TODO (Step 3c): Remove the `hidden` attribute from `#hitl-checkbox-group` when implementing
              `approve_concept` and `user_approval` in `pitch_generator/agent.py`. -->
-        <div id="hitl-checkbox-group" class="form-group form-group-checkbox" hidden>
+        <div id="hitl-checkbox-group" class="form-group form-group-checkbox">
           <label class="checkbox-label" for="require-approval-checkbox">
             <input id="require-approval-checkbox" name="require_approval" type="checkbox" />
             <span>Enable Human-in-the-Loop (HITL) verification (Step 3c)</span>
@@ -88,7 +88,7 @@
       <!-- [Guidepost — Step 3c: Enable the Human-in-the-Loop Approval Gate Card]
            TODO (Step 3c): Remove the `hidden` attribute from `#hitl-approval-card` when implementing
            `approve_concept` and `user_approval` in `pitch_generator/agent.py`. -->
-      <div id="hitl-approval-card" class="hitl-panel" role="region" aria-labelledby="heading-hitl" hidden>
+      <div id="hitl-approval-card" class="hitl-panel" role="region" aria-labelledby="heading-hitl">
         <h3 id="heading-hitl">Human-in-the-Loop Approval Gate (<code>approve_concept</code>)</h3>
         <p id="hitl-approval-prompt" class="pitch-content">
           Please approve the campaign concept (yes/no). Downstream agents are paused until you decide.

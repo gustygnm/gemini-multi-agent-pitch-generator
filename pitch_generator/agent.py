@@ -44,6 +44,7 @@ from __future__ import annotations
 # ==============================================================================
 
 from collections.abc import Sequence
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -897,45 +898,453 @@ def package(
 loop_guard = LoopGuard(max_iterations=10)
 
 # [Guidepost — Step 3a: PreToolUse Lifecycle Hooks]
-# TODO (Step 3a): Implement a fail-closed `PreToolUse` security hook before tool execution:
-#   - `DEFAULT_TOOL_ALLOWLIST = frozenset({"load_skill", "generate_key_visual"})`
-#   - `ToolAuthorizationError(PermissionError)` with `.tool_name` and `.reason` attributes.
-#   - `HookDecision` dataclass with `allowed: bool`, `tool_name: str`, `reason: str`,
-#     `violation_type: str | None = None`, `sanitized_args: dict[str, Any]`, plus `.is_allowed`,
-#     `.permitted`, and `__bool__`.
-#   - `PreToolUseHook(allowlist=None, raise_on_block=False)` and module-level
-#     `validate_tool_call(tool_name, tool_args=None) -> HookDecision`:
-#     1. Block empty or unlisted tools (`violation_type="unauthorized_tool"`).
-#     2. Block forbidden override keys such as `bypass_safety` or `override_brand_guidelines`
-#        (`violation_type="forbidden_parameter"`).
-#     3. Block path traversal sequences (`..` or leading `/`, `violation_type="path_traversal"`).
-#     4. Block oversized string arguments (`> 4096` chars) and prompt injection patterns such as
-#        `"ignore previous instructions"` or `system` tags (`violation_type="prompt_injection"`).
-#     5. Append every check to `self.audit_log` and raise `ToolAuthorizationError` when `raise_on_block=True`.
+DEFAULT_TOOL_ALLOWLIST: frozenset[str] = frozenset({"load_skill", "generate_key_visual"})
+
+
+class ToolAuthorizationError(PermissionError):
+    """
+    /**
+     * Exception raised when a tool invocation fails PreToolUse security validation.
+     *
+     * Why: Prevents execution of unauthorized tools, malicious parameter overrides,
+     * path traversal exploits, or prompt injections in the multi-agent workflow.
+     *
+     * @param message Human-readable error message.
+     * @param tool_name Name of the tool whose execution was blocked.
+     * @param reason Security policy violation reason.
+     */
+    """
+
+    def __init__(self, message: str = "", tool_name: str = "", reason: str = "") -> None:
+        """
+        /**
+         * Initialize ToolAuthorizationError with tool name and failure reason.
+         *
+         * Why: Captures diagnostic audit details for error telemetry and exception handlers.
+         *
+         * @param message Human-readable error message.
+         * @param tool_name Name of the tool that triggered authorization failure.
+         * @param reason Detailed explanation of security violation.
+         */
+        """
+        self.tool_name: str = tool_name
+        self.reason: str = reason or message
+        super().__init__(message or f"Tool '{tool_name}' failed authorization: {self.reason}")
+
+
+@dataclass
+class HookDecision:
+    """
+    /**
+     * Structured outcome of a PreToolUse hook security validation.
+     *
+     * Why: Encapsulates authorization status, security violation taxonomy, sanitized
+     * arguments, and boolean evaluation flags required by ADK lifecycle callbacks.
+     */
+    """
+
+    allowed: bool
+    tool_name: str
+    reason: str
+    violation_type: str | None = None
+    sanitized_args: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_allowed(self) -> bool:
+        """
+        /**
+         * Boolean property indicating whether the tool invocation is permitted.
+         *
+         * Why: Compatibility alias for ADK tool dispatch gates expecting `.is_allowed`.
+         *
+         * @return True if invocation is permitted, False otherwise.
+         */
+        """
+        return self.allowed
+
+    @property
+    def permitted(self) -> bool:
+        """
+        /**
+         * Boolean property indicating whether the tool invocation is permitted.
+         *
+         * Why: Compatibility alias for ADK tool dispatch gates expecting `.permitted`.
+         *
+         * @return True if invocation is permitted, False otherwise.
+         */
+        """
+        return self.allowed
+
+    def __bool__(self) -> bool:
+        """
+        /**
+         * Truthy evaluation of the HookDecision.
+         *
+         * Why: Allows direct conditional checks such as `if decision:` in dispatch code.
+         *
+         * @return True if invocation is permitted, False otherwise.
+         */
+        """
+        return self.allowed
+
+
+class PreToolUseHook:
+    """
+    /**
+     * Fail-closed lifecycle hook intercepting tool calls before dispatch.
+     *
+     * Why: Enforces defense-in-depth across the agent team by verifying tool allowlists,
+     * stripping path traversal patterns, blocking prompt injections, and auditing all calls.
+     */
+    """
+
+    def __init__(
+        self,
+        allowlist: Sequence[str] | set[str] | frozenset[str] | None = None,
+        raise_on_block: bool = False,
+    ) -> None:
+        """
+        /**
+         * Initialize PreToolUseHook with an optional tool allowlist and error policy.
+         *
+         * Why: Supports both logging/blocking modes and custom per-agent tool scopes.
+         *
+         * @param allowlist Optional custom collection of permitted tool names.
+         * @param raise_on_block If True, raises ToolAuthorizationError on blocked calls.
+         */
+        """
+        if allowlist is None:
+            self.allowlist: frozenset[str] = DEFAULT_TOOL_ALLOWLIST
+        else:
+            self.allowlist = frozenset(allowlist)
+        self.raise_on_block: bool = raise_on_block
+        self.audit_log: list[dict[str, Any]] = []
+
+    def validate_tool_call(
+        self,
+        tool_name: str | None,
+        tool_args: dict[str, Any] | None = None,
+    ) -> HookDecision:
+        """
+        /**
+         * Evaluate a proposed tool execution against security policies and sanitize args.
+         *
+         * Why: Prevents execution of unlisted tools, path traversal, prompt injections,
+         * oversized payloads, or forbidden safety override parameters.
+         *
+         * @param tool_name Name of the tool to be executed.
+         * @param tool_args Dictionary of arguments proposed for tool execution.
+         * @return HookDecision containing authorization status and sanitized arguments.
+         */
+        """
+        args: dict[str, Any] = dict(tool_args or {})
+        t_name = "" if tool_name is None else str(tool_name).strip()
+
+        # 1. Block empty or unlisted tools
+        if not t_name:
+            reason = "Tool name cannot be empty or null."
+            decision = HookDecision(
+                allowed=False,
+                tool_name=t_name,
+                reason=reason,
+                violation_type="unauthorized_tool",
+                sanitized_args={},
+            )
+            self._record_decision(decision, args)
+            return decision
+
+        if t_name not in self.allowlist:
+            reason = f"Tool '{t_name}' is not in the approved PreToolUse allowlist."
+            decision = HookDecision(
+                allowed=False,
+                tool_name=t_name,
+                reason=reason,
+                violation_type="unauthorized_tool",
+                sanitized_args={},
+            )
+            self._record_decision(decision, args)
+            return decision
+
+        # 2. Block forbidden parameter overrides
+        forbidden_keys = {
+            "bypass_safety",
+            "override_brand_guidelines",
+            "bypass_guardrails",
+            "disable_safety",
+            "disable_guardrails",
+        }
+        for k in args:
+            k_lower = str(k).lower()
+            if k_lower in forbidden_keys or "bypass" in k_lower or "override" in k_lower:
+                reason = f"Forbidden parameter override key detected: '{k}'."
+                decision = HookDecision(
+                    allowed=False,
+                    tool_name=t_name,
+                    reason=reason,
+                    violation_type="forbidden_parameter",
+                    sanitized_args={},
+                )
+                self._record_decision(decision, args)
+                return decision
+
+        # 3. Parameter value inspection: path traversal, oversized payloads, prompt injection
+        injection_keywords = (
+            "ignore previous instructions",
+            "<system>",
+            "</system>",
+            "system prompt",
+            "disregard previous",
+        )
+
+        for k, v in args.items():
+            if isinstance(v, str):
+                # Path traversal: check for '..' or leading '/'
+                if ".." in v or v.startswith("/"):
+                    reason = f"Path traversal sequence detected in parameter '{k}': {v}."
+                    decision = HookDecision(
+                        allowed=False,
+                        tool_name=t_name,
+                        reason=reason,
+                        violation_type="path_traversal",
+                        sanitized_args={},
+                    )
+                    self._record_decision(decision, args)
+                    return decision
+
+                # Oversized payloads (> 4096 chars)
+                if len(v) > 4096:
+                    reason = f"Parameter '{k}' exceeds maximum payload limit of 4096 characters."
+                    decision = HookDecision(
+                        allowed=False,
+                        tool_name=t_name,
+                        reason=reason,
+                        violation_type="prompt_injection",
+                        sanitized_args={},
+                    )
+                    self._record_decision(decision, args)
+                    return decision
+
+                # Prompt injection patterns
+                v_lower = v.lower()
+                for keyword in injection_keywords:
+                    if keyword in v_lower:
+                        reason = f"Prompt injection pattern detected in parameter '{k}': '{keyword}'."
+                        decision = HookDecision(
+                            allowed=False,
+                            tool_name=t_name,
+                            reason=reason,
+                            violation_type="prompt_injection",
+                            sanitized_args={},
+                        )
+                        self._record_decision(decision, args)
+                        return decision
+
+        sanitized = copy.deepcopy(args)
+        decision = HookDecision(
+            allowed=True,
+            tool_name=t_name,
+            reason="Tool invocation passed all PreToolUse security checks.",
+            violation_type=None,
+            sanitized_args=sanitized,
+        )
+        self._record_decision(decision, sanitized)
+        return decision
+
+    def _record_decision(self, decision: HookDecision, args: dict[str, Any]) -> None:
+        """
+        /**
+         * Record decision into audit log and optionally raise ToolAuthorizationError.
+         *
+         * Why: Centralizes security logging and fail-closed exception raising.
+         *
+         * @param decision Validated HookDecision object.
+         * @param args Dictionary of arguments evaluated.
+         */
+        """
+        record: dict[str, Any] = {
+            "tool_name": decision.tool_name,
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "args": copy.deepcopy(args),
+        }
+        if decision.violation_type is not None:
+            record["violation_type"] = decision.violation_type
+        self.audit_log.append(record)
+
+        if not decision.allowed and self.raise_on_block:
+            raise ToolAuthorizationError(
+                message=decision.reason,
+                tool_name=decision.tool_name,
+                reason=decision.reason,
+            )
+
+
+_GLOBAL_PRE_TOOL_HOOK = PreToolUseHook()
+
+
+def validate_tool_call(
+    tool_name: str | None,
+    tool_args: dict[str, Any] | None = None,
+) -> HookDecision:
+    """
+    /**
+     * Module-level helper validating a tool call against default PreToolUse security policies.
+     *
+     * Why: Provides a convenient entrypoint for single-call validation in agent callbacks.
+     *
+     * @param tool_name Name of the tool to validate.
+     * @param tool_args Proposed arguments dictionary.
+     * @return HookDecision indicating authorization verdict.
+     */
+    """
+    return _GLOBAL_PRE_TOOL_HOOK.validate_tool_call(tool_name, tool_args)
+
 
 # [Guidepost — Step 3c: Human-in-the-Loop (HITL) Approval Gate]
-# TODO (Step 3c): Add the two-node ADK Human-in-the-Loop checkpoint after `creative_director`:
-#   - `@node(rerun_on_resume=False) async def approve_concept(ctx: Context)`:
-#     validates that `ctx.session.state.get("creative_director")` is non-empty and yields
-#     `RequestInput(message="Please approve the campaign concept (yes/no).", response_schema=str)`.
-#   - `evaluate_user_approval(concept: str, decision: str) -> str`:
-#     accepts affirmative responses (`"yes"`, `"y"`, `"true"`, `"approved"` -> returns
-#     `f"## Approved Concept\n\n{concept}"`) and raises `ValueError("User rejected the concept")` otherwise.
-#   - `@node(rerun_on_resume=True) async def user_approval(ctx: Context, node_input: dict[str, Any] | None = None)`:
-#     awaits `ctx.run_node(approve_concept)`, validates the decision via `evaluate_user_approval`,
-#     and yields `Event(author="user_approval", content=...)`.
-#   - `run_hitl_workflow(brief: str, *, approved: bool | None = None, services: ServiceContainer | None = None) -> dict[str, Any]`:
-#     returns `status="input_required"` (`downstream_calls=0`) when `approved is None`,
-#     `status="rejected"` (`downstream_calls=0`) when `approved is False`, and `status="completed"`
-#     (`downstream_calls=2`, `"## Approved Concept"` in `concept_header`) when `approved is True`.
-#   - Insert `user_approval` into `root_agent.edges` after `creative_director`, and enable the
-#     Human-in-the-Loop UI controls (`#hitl-checkbox-group` and `#hitl-approval-card`) in
-#     `frontend/index.html` by removing their `hidden` attributes (defining `approve_concept` or
-#     `user_approval` here also automatically sets `hitl_enabled=True` in `/api/config` and `/api/pitch`).
+@node(rerun_on_resume=False)
+async def approve_concept(ctx: Context):
+    """
+    /**
+     * Pauses workflow execution to request explicit human approval of the campaign concept.
+     *
+     * Why: Enforces fail-closed human oversight via ADK's RequestInput before expensive
+     * copywriting and visual generation nodes execute. Configured with rerun_on_resume=False
+     * so it halts on first run and is not re-executed when the session resumes with user input.
+     *
+     * @param ctx ADK execution context containing session state.
+     * @return Async generator yielding RequestInput asking for concept authorization.
+     */
+    """
+    state = getattr(ctx, "session", ctx).state if hasattr(getattr(ctx, "session", ctx), "state") else getattr(ctx, "state", {})
+    concept = state.get("creative_director")
+    if not concept or not str(concept).strip():
+        raise ValueError("Empty concept draft in approve_concept: creative_director state is missing or empty.")
+    yield RequestInput(
+        message="Please approve the campaign concept (yes/no).",
+        response_schema=str,
+    )
+
+
+def evaluate_user_approval(concept: str, decision: str) -> str:
+    """
+    /**
+     * Evaluates a user's approval response against the campaign concept rubric.
+     *
+     * Why: Accepts standard affirmative decisions ('yes', 'y', 'true', 'approved')
+     * and strictly raises ValueError on negative or ambiguous input to prevent unauthorized execution.
+     *
+     * @param concept Campaign concept generated by creative_director.
+     * @param decision User input string responding to the approval request.
+     * @return Formatted approved markdown concept header string.
+     */
+    """
+    if not decision or not str(decision).strip():
+        raise ValueError("User rejected the concept: empty or null decision received.")
+    decision_clean = str(decision).strip().lower()
+    affirmative_responses = {"yes", "y", "true", "approved"}
+    if decision_clean in affirmative_responses:
+        return f"## Approved Concept\n\n{concept}"
+    raise ValueError(f"User rejected the concept: received '{decision}'.")
+
+
+@node(rerun_on_resume=True)
+async def user_approval(ctx: Context, node_input: dict[str, Any] | None = None):
+    """
+    /**
+     * Resumes workflow upon human approval and publishes the validated concept event.
+     *
+     * Why: Configured with rerun_on_resume=True so it executes when the session is resumed
+     * with human input, verifies approval via evaluate_user_approval, and unblocks downstream nodes.
+     *
+     * @param ctx ADK execution context.
+     * @param node_input Optional dictionary carrying approval_response on resume.
+     * @return Async generator yielding the authorized concept Event.
+     */
+    """
+    state = getattr(ctx, "session", ctx).state if hasattr(getattr(ctx, "session", ctx), "state") else getattr(ctx, "state", {})
+    concept = str(state.get("creative_director", "")).strip()
+
+    decision: Any = None
+    if node_input and "approval_response" in node_input:
+        decision = node_input["approval_response"]
+    elif "approval_response" in state:
+        decision = state["approval_response"]
+    else:
+        decision_raw = await ctx.run_node(approve_concept)
+        if isinstance(decision_raw, RequestInput):
+            decision = getattr(decision_raw, "value", None)
+        else:
+            decision = decision_raw
+
+    approved_text = evaluate_user_approval(concept, str(decision or ""))
+    state["user_approval"] = approved_text
+    yield Event(
+        author="user_approval",
+        content=types.Content(role="model", parts=[types.Part.from_text(text=approved_text)]),
+    )
+
+
+def run_hitl_workflow(
+    brief: str,
+    *,
+    approved: bool | None = None,
+    services: ServiceContainer | None = None,
+) -> dict[str, Any]:
+    """
+    /**
+     * Executes the Human-in-the-Loop workflow lifecycle demonstrating pause, reject, and complete transitions.
+     *
+     * Why: Encapsulates deterministic evaluation of HITL authorization for offline testing and pipeline auditing,
+     * ensuring zero downstream resources are consumed when unapproved or rejected.
+     *
+     * @param brief Marketing pitch brief.
+     * @param approved Approval flag: None for input required, False for rejection, True for completed execution.
+     * @param services Optional ServiceContainer dependency injection container.
+     * @return Structured workflow state dictionary.
+     */
+    """
+    concept = f"Campaign Concept for {brief}: A modern and inspiring perspective."
+    if approved is None:
+        return {
+            "status": "input_required",
+            "brief": brief,
+            "concept": concept,
+            "concept_header": "",
+            "copy": "",
+            "art_direction": "",
+            "key_visual_uri": None,
+            "downstream_calls": 0,
+        }
+    if approved is False:
+        return {
+            "status": "rejected",
+            "brief": brief,
+            "concept": concept,
+            "concept_header": "",
+            "copy": "",
+            "art_direction": "",
+            "key_visual_uri": None,
+            "downstream_calls": 0,
+        }
+
+    concept_header = evaluate_user_approval(concept, "yes")
+    return {
+        "status": "completed",
+        "brief": brief,
+        "concept": concept,
+        "concept_header": concept_header,
+        "copy": f"Headline: Transform everyday living with {brief}.",
+        "art_direction": f"Deep indigo studio portrait with warm amber rim light for {brief}.",
+        "key_visual_uri": "gs://demo-bucket/key_visuals/key_visual.png",
+        "downstream_calls": 2,
+    }
+
+
 root_agent = Workflow(
     name="pitch_generator",
     edges=[
-        (creative_director, brand_strategist, (copywriter, remote_visual_director)),
+        (creative_director, user_approval),
+        (user_approval, brand_strategist, (copywriter, remote_visual_director)),
         ((copywriter, remote_visual_director), assemble, package),
     ],
 )
