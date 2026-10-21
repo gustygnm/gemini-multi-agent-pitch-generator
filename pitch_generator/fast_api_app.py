@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -44,6 +45,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from pitch_generator.agent import (
+    build_a2a_visual_director_app,
     resume_pitch_workflow,
     root_agent,
     run_pitch_workflow,
@@ -659,7 +661,11 @@ def create_app(services: ServiceContainer | None = None) -> PitchFastAPIApp:
 #   - Check `os.environ.get("SERVICE_ROLE", "pitch-generator").strip().lower()` and when `SERVICE_ROLE == "visual-director"`,
 #     bind `app = build_a2a_visual_director_app()` so the same container image can serve either `pitch-generator` (port 8080)
 #     or `visual-director` (port 8801 / Cloud Run).
-app: PitchFastAPIApp = create_app()
+_service_role: str = os.environ.get("SERVICE_ROLE", "pitch-generator").strip().lower()
+if _service_role == "visual-director":
+    app: PitchFastAPIApp = build_a2a_visual_director_app()
+else:
+    app: PitchFastAPIApp = create_app()
 
 
 def configure_app_services(services: ServiceContainer) -> None:
