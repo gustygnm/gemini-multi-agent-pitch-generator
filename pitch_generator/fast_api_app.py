@@ -460,11 +460,20 @@ class PitchFastAPIApp:
             "/app.js": ("app.js", "application/javascript; charset=utf-8"),
             "/frontend/app.js": ("app.js", "application/javascript; charset=utf-8"),
             "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
+            "/placeholder.png": ("placeholder.png", "image/png"),
+            "/frontend/placeholder.png": ("placeholder.png", "image/png"),
+            "/static/placeholder.png": ("placeholder.png", "image/png"),
         }
         if method_upper == "GET" and clean_path in static_map:
             rel_name, content_type = static_map[clean_path]
             file_path = FRONTEND_DIR / rel_name
             if file_path.is_file():
+                if content_type.startswith("image/"):
+                    return TestResponse(
+                        200,
+                        file_path.read_bytes(),
+                        headers={"content-type": content_type},
+                    )
                 return TestResponse(
                     200,
                     file_path.read_text(encoding="utf-8"),
