@@ -46,8 +46,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 import copy
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 from pitch_generator.app_utils.adk_primitives import (
@@ -1354,24 +1356,427 @@ app = App(root_agent=root_agent, name="pitch_generator")
 
 
 # [Guidepost — Step 4a: Tokenomics & Context Optimization]
-# TODO (Step 4a): Implement memory compression, sliding-window pruning, SHA-256 prompt caching, and model routing:
-#   - `estimate_tokens(text: str | None) -> int`: returns `0` for empty/whitespace text, else `max(1, len(text.strip()) // 4)`.
-#   - `CompressedHistoryList(list)`: `list` subclass with `.turns`, `.history`, `.summary`,
-#     `.original_tokens`, `.optimized_tokens`, and `.tokens_saved` attributes.
-#   - `compress_memory(turns: Sequence[dict[str, Any]], keep_recent: int = 2) -> CompressedHistoryList`:
-#     summarizes older turns prior to the last `keep_recent` turns into a single
-#     `{"role": "system", "compressed": True, "content": ...}` entry while preserving the most recent turns verbatim.
-#   - `prune_history(turns: Sequence[dict[str, Any]], max_turns: int = 6, max_tokens: int = 512) -> CompressedHistoryList`:
-#     validates `max_turns > 0` and `max_tokens > 0` (raising `ValueError` otherwise), keeps the newest turns
-#     within the turn/token budget, and truncates a single oversized turn (`"truncated": True`) to fit `max_tokens`.
-#   - `PromptCacheManager(default_ttl_seconds: int = 300)`: `.get_or_create(static_prompt: str, ttl_seconds: int | None = None)`
-#     validates non-empty text, computes a 64-char SHA-256 hex `cache_key` (`hashlib.sha256(...).hexdigest()`),
-#     and tracks TTL expiration, `"cache_hit"` (`True`/`False`), and `"saved_tokens"`.
-#   - `select_model_strategy(tier: str = "flash") -> dict[str, Any]` supporting tiers
-#     `("flash", "pro", "low", "high", "local")` (raising `ValueError` on unknown tiers) and returning
-#     `"tier"`, `"model_id"`, `"target"`, `"cost_tier"`, and `"thinking_budget"`.
-#   - `TokenomicsManager(max_turns: int = 6, max_tokens: int = 512)`: `.optimize(turns, static_prompt="", max_turns=..., max_tokens=..., tier="flash")`
-#     combining `compress_memory`, `prune_history`, `PromptCacheManager`, and `select_model_strategy`.
+def estimate_tokens(text: str | None) -> int:
+    """
+    /**
+     * Deterministically estimates token consumption for a given string using character heuristics.
+     *
+     * Why: Provides a fast, offline token count estimator (max(1, len(text.strip()) // 4))
+     * without invoking external tokenizer libraries or making network calls.
+     *
+     * @param text Input string or None.
+     * @return Estimated token count (0 for empty/whitespace, >= 1 otherwise).
+     */
+    """
+    if text is None:
+        return 0
+    if not isinstance(text, str):
+        text = str(text)
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return max(1, len(stripped) // 4)
+
+
+class CompressedHistoryList(list):
+    """
+    /**
+     * Specialized list subclass representing an optimized conversation history with token metrics.
+     *
+     * Why: Preserves standard list indexing and iteration while exposing structured token savings
+     * metadata (.original_tokens, .optimized_tokens, .tokens_saved, .summary, .turns, .history).
+     */
+    """
+
+    def __init__(
+        self,
+        items: Sequence[Any] | None = None,
+        summary: str = "",
+        original_tokens: int = 0,
+        optimized_tokens: int = 0,
+        tokens_saved: int = 0,
+    ) -> None:
+        """
+        /**
+         * Initialize CompressedHistoryList with conversation items and token accounting metrics.
+         *
+         * @param items Initial sequence of conversation turns.
+         * @param summary System summary generated from older turns.
+         * @param original_tokens Token count before optimization.
+         * @param optimized_tokens Token count after compression/pruning.
+         * @param tokens_saved Total tokens saved.
+         */
+        """
+        super().__init__(items or [])
+        self.summary: str = summary
+        self.original_tokens: int = original_tokens
+        self.optimized_tokens: int = optimized_tokens
+        self.tokens_saved: int = tokens_saved
+
+    @property
+    def turns(self) -> list[Any]:
+        """
+        /**
+         * Access the optimized conversation turns as a standard Python list.
+         *
+         * Why: Compatibility alias for ADK memory managers inspecting `.turns`.
+         *
+         * @return Standard list of conversation turn dictionaries.
+         */
+        """
+        return list(self)
+
+    @property
+    def history(self) -> list[Any]:
+        """
+        /**
+         * Access the optimized conversation turns as a standard Python list.
+         *
+         * Why: Compatibility alias for session history inspecters expecting `.history`.
+         *
+         * @return Standard list of conversation turn dictionaries.
+         */
+        """
+        return list(self)
+
+
+def compress_memory(
+    turns: Sequence[dict[str, Any]],
+    keep_recent: int = 2,
+) -> CompressedHistoryList:
+    """
+    /**
+     * Compresses older conversation history turns into a single synthesized system summary turn.
+     *
+     * Why: Prevents long-running multi-turn sessions from exhausting LLM context limits
+     * while preserving the most recent `keep_recent` interaction turns verbatim.
+     *
+     * @param turns Sequence of conversation turn dictionaries.
+     * @param keep_recent Number of recent interaction turns to keep uncompressed (defaults to 2).
+     * @return CompressedHistoryList with summary header and recent turns.
+     */
+    """
+    if not turns:
+        return CompressedHistoryList([], summary="", original_tokens=0, optimized_tokens=0, tokens_saved=0)
+
+    orig_tokens = sum(estimate_tokens(t.get("content", "")) for t in turns)
+    if len(turns) <= keep_recent:
+        items = [copy.deepcopy(t) for t in turns]
+        return CompressedHistoryList(
+            items,
+            summary="",
+            original_tokens=orig_tokens,
+            optimized_tokens=orig_tokens,
+            tokens_saved=0,
+        )
+
+    older = turns[:-keep_recent]
+    recent = turns[-keep_recent:]
+
+    summary_text = f"Summary of earlier conversation ({len(older)} turns): user and assistant discussed campaign context."
+    summary_item: dict[str, Any] = {
+        "role": "system",
+        "content": summary_text,
+        "compressed": True,
+    }
+
+    compressed_items = [summary_item] + [copy.deepcopy(t) for t in recent]
+    opt_tokens = sum(estimate_tokens(t.get("content", "")) for t in compressed_items)
+    tokens_saved = max(0, orig_tokens - opt_tokens)
+
+    return CompressedHistoryList(
+        compressed_items,
+        summary=summary_text,
+        original_tokens=orig_tokens,
+        optimized_tokens=opt_tokens,
+        tokens_saved=tokens_saved,
+    )
+
+
+def prune_history(
+    turns: Sequence[dict[str, Any]],
+    max_turns: int = 6,
+    max_tokens: int = 512,
+) -> CompressedHistoryList:
+    """
+    /**
+     * Enforces a sliding-window turn count and token budget across conversation history.
+     *
+     * Why: Guarantees a hard ceiling on prompt tokens sent to Gemini models, truncating
+     * single oversized turns if necessary.
+     *
+     * @param turns Sequence of conversation turn dictionaries.
+     * @param max_turns Maximum number of turns allowed in the window (> 0).
+     * @param max_tokens Maximum token budget allowed for the window (> 0).
+     * @return CompressedHistoryList containing pruned and budgeted turns.
+     */
+    """
+    if max_turns <= 0:
+        raise ValueError(f"max_turns must be a positive integer, got {max_turns}.")
+    if max_tokens <= 0:
+        raise ValueError(f"max_tokens must be a positive integer, got {max_tokens}.")
+
+    if not turns:
+        return CompressedHistoryList([], original_tokens=0, optimized_tokens=0, tokens_saved=0)
+
+    orig_tokens = sum(estimate_tokens(t.get("content", "")) for t in turns)
+
+    # Consider the newest max_turns
+    candidate = list(turns[-max_turns:])
+    selected: list[dict[str, Any]] = []
+    current_tokens = 0
+
+    for turn in reversed(candidate):
+        turn_copy = copy.deepcopy(turn)
+        turn_tok = estimate_tokens(turn_copy.get("content", ""))
+        if current_tokens + turn_tok <= max_tokens:
+            selected.append(turn_copy)
+            current_tokens += turn_tok
+        else:
+            if not selected:
+                # Truncate single oversized turn to fit max_tokens
+                char_limit = max(1, max_tokens * 4)
+                content = str(turn_copy.get("content", ""))
+                truncated_content = content[:char_limit]
+                while estimate_tokens(truncated_content) > max_tokens and len(truncated_content) > 1:
+                    truncated_content = truncated_content[:-4]
+                turn_copy["content"] = truncated_content
+                turn_copy["truncated"] = True
+                selected.append(turn_copy)
+                current_tokens += estimate_tokens(truncated_content)
+            break
+
+    selected.reverse()
+    opt_tokens = sum(estimate_tokens(t.get("content", "")) for t in selected)
+    tokens_saved = max(0, orig_tokens - opt_tokens)
+
+    return CompressedHistoryList(
+        selected,
+        summary="",
+        original_tokens=orig_tokens,
+        optimized_tokens=opt_tokens,
+        tokens_saved=tokens_saved,
+    )
+
+
+class PromptCacheManager:
+    """
+    /**
+     * Deterministic in-memory prompt cache manager using SHA-256 content addressing.
+     *
+     * Why: Prevents redundant token charges for static system prompts and brand rubrics
+     * by computing a 64-character SHA-256 fingerprint with TTL expiration tracking.
+     */
+    """
+
+    def __init__(self, default_ttl_seconds: int = 300) -> None:
+        """
+        /**
+         * Initialize PromptCacheManager with a default time-to-live expiration window.
+         *
+         * @param default_ttl_seconds Default TTL in seconds (defaults to 300).
+         */
+        """
+        self.default_ttl_seconds: int = default_ttl_seconds
+        self._cache: dict[str, dict[str, Any]] = {}
+
+    def get_or_create(
+        self,
+        static_prompt: str,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        /**
+         * Retrieve or register a static prompt in the cache using SHA-256 keying.
+         *
+         * Why: Validates non-empty input, calculates sha256 hex digest, and reports
+         * cache_hit status and estimated saved tokens.
+         *
+         * @param static_prompt Invariant system instruction or guideline string.
+         * @param ttl_seconds Optional TTL override (0 forces immediate expiration).
+         * @return Dictionary with cache_key, cache_hit, saved_tokens, and ttl_seconds.
+         */
+        """
+        if not static_prompt or not str(static_prompt).strip():
+            raise ValueError("Static prompt text cannot be empty or null.")
+
+        clean_text = str(static_prompt).strip()
+        cache_key = hashlib.sha256(clean_text.encode("utf-8")).hexdigest()
+        effective_ttl = self.default_ttl_seconds if ttl_seconds is None else ttl_seconds
+        prompt_tokens = estimate_tokens(clean_text)
+
+        now = time.time()
+        cached_entry = self._cache.get(cache_key)
+
+        if cached_entry is not None and effective_ttl > 0 and now < cached_entry["expires_at"]:
+            return {
+                "cache_key": cache_key,
+                "cache_hit": True,
+                "saved_tokens": prompt_tokens,
+                "ttl_seconds": effective_ttl,
+                "tokens": prompt_tokens,
+            }
+
+        # Cache miss or expired
+        if effective_ttl > 0:
+            self._cache[cache_key] = {
+                "expires_at": now + effective_ttl,
+                "tokens": prompt_tokens,
+            }
+
+        return {
+            "cache_key": cache_key,
+            "cache_hit": False,
+            "saved_tokens": 0,
+            "ttl_seconds": effective_ttl,
+            "tokens": prompt_tokens,
+        }
+
+
+def select_model_strategy(tier: str = "flash") -> dict[str, Any]:
+    """
+    /**
+     * Selects model configuration, execution target, and thinking budget across 5 tiers.
+     *
+     * Why: Routes queries dynamically across 'flash', 'pro', 'low', 'high', and 'local' tiers
+     * to optimize latency, cost, and reasoning capability according to task complexity.
+     *
+     * @param tier Model tier name ('flash', 'pro', 'low', 'high', 'local').
+     * @return Strategy dictionary containing tier, model_id, target, cost_tier, and thinking_budget.
+     */
+    """
+    tier_clean = str(tier).strip().lower()
+    strategies: dict[str, dict[str, Any]] = {
+        "flash": {
+            "tier": "flash",
+            "model_id": "gemini-3.8-flash",
+            "target": "cloud",
+            "cost_tier": "low",
+            "thinking_budget": 0,
+        },
+        "pro": {
+            "tier": "pro",
+            "model_id": "gemini-3.8-pro",
+            "target": "cloud",
+            "cost_tier": "high",
+            "thinking_budget": 1024,
+        },
+        "low": {
+            "tier": "low",
+            "model_id": "gemini-3.8-flash",
+            "target": "cloud",
+            "cost_tier": "low",
+            "thinking_budget": 0,
+        },
+        "high": {
+            "tier": "high",
+            "model_id": "gemini-3.8-pro",
+            "target": "cloud",
+            "cost_tier": "high",
+            "thinking_budget": 2048,
+        },
+        "local": {
+            "tier": "local",
+            "model_id": "gemma-2-2b-it",
+            "target": "edge",
+            "cost_tier": "free",
+            "thinking_budget": 0,
+        },
+    }
+
+    if tier_clean not in strategies:
+        raise ValueError(
+            f"Unsupported model tier '{tier}'. Supported tiers: {', '.join(sorted(strategies.keys()))}"
+        )
+
+    return copy.deepcopy(strategies[tier_clean])
+
+
+class TokenomicsManager:
+    """
+    /**
+     * Unified context optimization coordinator combining compression, pruning, and caching.
+     *
+     * Why: Coordinates memory compression, sliding window history pruning, SHA-256 prompt caching,
+     * and model strategy routing into a single optimize call to maximize throughput and minimize cost.
+     */
+    """
+
+    def __init__(
+        self,
+        max_turns: int = 6,
+        max_tokens: int = 512,
+        default_ttl_seconds: int = 300,
+    ) -> None:
+        """
+        /**
+         * Initialize TokenomicsManager with context window limits and caching policies.
+         *
+         * @param max_turns Default sliding window turn budget.
+         * @param max_tokens Default sliding window token budget.
+         * @param default_ttl_seconds Default prompt cache TTL in seconds.
+         */
+        """
+        self.max_turns: int = max_turns
+        self.max_tokens: int = max_tokens
+        self.cache_manager: PromptCacheManager = PromptCacheManager(default_ttl_seconds=default_ttl_seconds)
+
+    def optimize(
+        self,
+        turns: Sequence[dict[str, Any]],
+        static_prompt: str = "",
+        max_turns: int | None = None,
+        max_tokens: int | None = None,
+        tier: str = "flash",
+    ) -> dict[str, Any]:
+        """
+        /**
+         * Optimizes conversation history and prompt tokens for model dispatch.
+         *
+         * Why: Sequentially compresses older turns, applies sliding window pruning, checks
+         * prompt cache hits, and selects the appropriate model tier.
+         *
+         * @param turns Input conversation turns sequence.
+         * @param static_prompt Optional invariant system prompt or instructions.
+         * @param max_turns Optional turn count ceiling override.
+         * @param max_tokens Optional token budget ceiling override.
+         * @param tier Model tier selection ('flash', 'pro', 'low', 'high', 'local').
+         * @return Optimization outcome dictionary with turns, token savings, and strategy.
+         */
+        """
+        eff_max_turns = max_turns if max_turns is not None else self.max_turns
+        eff_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        strategy = select_model_strategy(tier)
+
+        orig_turns_tokens = sum(estimate_tokens(t.get("content", "")) for t in turns)
+        static_tokens = estimate_tokens(static_prompt) if static_prompt else 0
+        total_orig_tokens = orig_turns_tokens + static_tokens
+
+        # 1. Compress memory
+        compressed = compress_memory(turns)
+
+        # 2. Prune history to budget
+        pruned = prune_history(compressed, max_turns=eff_max_turns, max_tokens=eff_max_tokens)
+
+        # 3. Prompt caching check
+        cache_info: dict[str, Any] = {"cache_hit": False, "cache_key": "", "saved_tokens": 0}
+        if static_prompt:
+            cache_info = self.cache_manager.get_or_create(static_prompt)
+
+        pruned_tokens = sum(estimate_tokens(t.get("content", "")) for t in pruned)
+        effective_static_tokens = 0 if cache_info["cache_hit"] else static_tokens
+        optimized_tokens = pruned_tokens + effective_static_tokens
+        tokens_saved = max(0, total_orig_tokens - optimized_tokens)
+
+        return {
+            "turns": list(pruned),
+            "original_tokens": total_orig_tokens,
+            "optimized_tokens": optimized_tokens,
+            "tokens_saved": tokens_saved,
+            "cache_hit": cache_info["cache_hit"],
+            "cache_key": cache_info["cache_key"],
+            "selected_strategy": strategy,
+        }
 
 
 # ==============================================================================
