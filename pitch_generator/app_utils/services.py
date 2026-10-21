@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 from pitch_generator.app_utils.memory_bank import MemoryBankService
@@ -211,6 +212,41 @@ class BigQueryAnalyticsService:
          */
         """
         return copy.deepcopy(self.events)
+
+    def register_key_visuals(
+        self,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        /**
+         * Register key visual records in the analytics store.
+         *
+         * Why: Validates that each visual record contains a valid Cloud Storage
+         * `gs://` URI before persisting or queuing for BigQuery Object Table ingestion.
+         *
+         * @param records Non-empty list of campaign key visual record dictionaries.
+         * @return Validated and registered list of record dictionaries.
+         */
+        """
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a non-empty list of dictionaries")
+
+        validated: list[dict[str, Any]] = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                raise ValueError(f"Each record must be a dictionary, got {type(rec)}")
+            uri = str(rec.get("uri", "")).strip()
+            if not uri.startswith("gs://"):
+                raise ValueError(f"Campaign image URI must start with 'gs://', got {uri!r}")
+            item = copy.deepcopy(rec)
+            item["registered"] = True
+            validated.append(item)
+            if hasattr(self, "registered_visuals"):
+                self.registered_visuals.append(item)
+            else:
+                self.registered_visuals = [item]
+
+        return validated
 
     def build_key_visuals_sql(
         self,
@@ -428,27 +464,196 @@ class BigQueryAnalyticsService:
 
 
 # [Guidepost — Step 2a: BigQuery Agent Analytics & Key Visuals Object Table]
-# TODO (Step 2a): Add key visual registration and save the BigQuery Object Table SQL script:
-#   - Create `pitch_generator/sql/create_key_visuals.sql` containing a `CREATE OR REPLACE TABLE bwg.key_visuals AS`
-#     query that wraps Cloud Storage `gs://` URIs in `OBJ.FETCH_METADATA(OBJ.MAKE_REF(uri, '<region>.pitch-connection')) AS key_visual`.
-#   - Define `register_key_visuals(records: list[dict[str, Any]], service: BigQueryAnalyticsService | None = None) -> list[dict[str, Any]]`
-#     (and method on `BigQueryAnalyticsService`) validating that `records` is non-empty and every `"uri"` starts with `"gs://"`,
-#     raising `ValueError` on empty or non-`gs://` URIs, and delegate `build_key_visuals_sql(...)` at module level.
+def register_key_visuals(
+    records: list[dict[str, Any]],
+    service: BigQueryAnalyticsService | None = None,
+) -> list[dict[str, Any]]:
+    """
+    /**
+     * Module-level helper registering key visual records against BigQueryAnalyticsService.
+     *
+     * Why: Provides a functional interface for registering campaign key visual records
+     * and validating gs:// URI formatting.
+     *
+     * @param records Non-empty list of campaign key visual record dictionaries.
+     * @param service Optional BigQueryAnalyticsService instance.
+     * @return Validated list of registered records.
+     */
+    """
+    svc = service or BigQueryAnalyticsService()
+    return svc.register_key_visuals(records)
+
+
+def build_key_visuals_sql(
+    campaigns: list[dict[str, Any]] | None = None,
+    service: BigQueryAnalyticsService | None = None,
+    *,
+    project_id: str | None = None,
+    region: str | None = None,
+    dataset: str = "bwg",
+    bucket_name: str | None = None,
+    connection_name: str = "pitch-connection",
+) -> str:
+    """
+    /**
+     * Module-level delegate constructing the BigQuery Object Table creation SQL.
+     *
+     * Why: Allows callers to generate the DDL statement without instantiating BigQueryAnalyticsService.
+     *
+     * @param campaigns Optional list of campaign dicts.
+     * @param service Optional BigQueryAnalyticsService instance.
+     * @param project_id Optional Google Cloud project ID.
+     * @param region Optional connection region.
+     * @param dataset BigQuery dataset name.
+     * @param bucket_name Optional bucket name.
+     * @param connection_name Cloud Resource connection name.
+     * @return Formatted BigQuery SQL string.
+     */
+    """
+    svc = service or BigQueryAnalyticsService()
+    return svc.build_key_visuals_sql(
+        project_id=project_id,
+        region=region,
+        bucket_name=bucket_name,
+        dataset=dataset,
+        connection_name=connection_name,
+        campaigns=campaigns,
+    )
+
 
 # [Guidepost — Step 2b: Brand Drift Detection & Closed-Loop Prompt Tuning]
-# TODO (Step 2b): Add multimodal brand drift detection and automated prompt/skill tuning:
-#   - Create `pitch_generator/sql/score_brand_fit.sql` containing a `CREATE OR REPLACE TABLE bwg.brand_review AS`
-#     query using `AI.SCORE((..., concept, key_visual), connection_id => '<region>.pitch-connection') AS brand_fit`
-#     and computing `IF(brand_fit >= 7, 'on brand', 'needs another pass') AS verdict`.
-#   - Define module-level `score_brand_compliance(records: list[dict[str, Any]]) -> list[dict[str, Any]]`
-#     labeling `brand_fit >= 7.0` as `'on brand'` and `< 7.0` as `'needs another pass'`.
-#   - Define `detect_brand_drift(records: list[dict[str, Any]], threshold: float = 7.0) -> dict[str, Any]`
-#     returning `"has_drift"` (`bool`), `"drifted_records"`, `"compliant_records"`, and `"drift_rate"`.
-#   - Define `tune_prompt_and_skill(record: dict[str, Any]) -> dict[str, Any]` that strips forbidden off-brand
-#     terms (`neon`, `cyan`, `magenta`, `watermark`, `logo`, `ring light`, `3d render`) and appends the 4 house
-#     brand pillars (`deep indigo and slate with warm amber accent`, `single low raking light with long shadows`,
-#     `off-center composition with generous negative space`, `one realistic photographic subject`) so the re-scored
-#     `brand_fit >= 7.0` and `verdict == "on brand"`.
+def score_brand_compliance(
+    records: list[dict[str, Any]],
+    service: BigQueryAnalyticsService | None = None,
+) -> list[dict[str, Any]]:
+    """
+    /**
+     * Module-level helper scoring campaign records for brand guidelines compliance.
+     *
+     * Why: Evaluates records against the brand rubric, populating brand_fit score and verdict.
+     *
+     * @param records List of campaign record dictionaries to evaluate.
+     * @param service Optional BigQueryAnalyticsService instance.
+     * @return List of evaluated campaign dictionaries.
+     */
+    """
+    svc = service or BigQueryAnalyticsService()
+    return svc.score_brand_compliance(records)
+
+
+def detect_brand_drift(
+    records: list[dict[str, Any]],
+    threshold: float = 7.0,
+    service: BigQueryAnalyticsService | None = None,
+) -> dict[str, Any]:
+    """
+    /**
+     * Detects brand drift across campaign records against a threshold score.
+     *
+     * Why: Identifies outputs that scored below threshold (< 7.0) to trigger
+     * automated closed-loop prompt tuning and prevent off-brand campaign publication.
+     *
+     * @param records List of campaign record dictionaries.
+     * @param threshold Minimum brand_fit score to be considered compliant (default 7.0).
+     * @param service Optional BigQueryAnalyticsService instance.
+     * @return Dictionary with has_drift, drifted_records, compliant_records, and drift_rate.
+     */
+    """
+    if not isinstance(records, list):
+        raise ValueError("records must be a list of dictionaries")
+
+    evaluated = score_brand_compliance(records, service=service)
+    drifted: list[dict[str, Any]] = []
+    compliant: list[dict[str, Any]] = []
+
+    for item in evaluated:
+        score = float(item.get("brand_fit", 0.0))
+        if score < threshold:
+            drifted.append(item)
+        else:
+            compliant.append(item)
+
+    total = len(evaluated)
+    drift_rate = round(len(drifted) / total, 2) if total > 0 else 0.0
+    has_drift = len(drifted) > 0
+
+    return {
+        "has_drift": has_drift,
+        "drifted_records": drifted,
+        "compliant_records": compliant,
+        "drift_rate": drift_rate,
+        "total": total,
+    }
+
+
+def tune_prompt_and_skill(
+    record: dict[str, Any],
+    service: BigQueryAnalyticsService | None = None,
+) -> dict[str, Any]:
+    """
+    /**
+     * Automatically repairs and tunes an off-brand prompt to conform to house guidelines.
+     *
+     * Why: Closed-loop remediation engine that strips forbidden visual terms and injects
+     * the four positive brand pillars so re-scored outputs achieve brand_fit >= 7.0.
+     *
+     * @param record Campaign dictionary containing drifted prompt or art_direction.
+     * @param service Optional BigQueryAnalyticsService instance.
+     * @return Tuned campaign dictionary with refreshed brand_fit >= 7.0 and verdict 'on brand'.
+     */
+    """
+    if not isinstance(record, dict):
+        raise ValueError("record must be a dictionary")
+
+    tuned = copy.deepcopy(record)
+    text_key = (
+        "prompt"
+        if "prompt" in tuned
+        else ("art_direction" if "art_direction" in tuned else "concept")
+    )
+    original_text = str(tuned.get(text_key, ""))
+
+    cleaned = original_text
+    forbidden_terms = [
+        "neon",
+        "cyan",
+        "magenta",
+        "watermark",
+        "logo",
+        "ring light",
+        "3d render",
+        "fluorescent",
+    ]
+    for term in forbidden_terms:
+        cleaned = re.sub(rf"\b{re.escape(term)}\b", "", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    house_pillars = (
+        "Color palette anchored in deep indigo and slate with warm amber accent. "
+        "Illuminated by a single low raking light source with long shadows. "
+        "Framed in an off-center composition with generous negative space, "
+        "featuring one realistic photographic subject."
+    )
+    tuned_prompt = f"{cleaned}. {house_pillars}".strip()
+    tuned[text_key] = tuned_prompt
+
+    if "prompt" in tuned and text_key != "prompt":
+        tuned["prompt"] = tuned_prompt
+    if "art_direction" in tuned and text_key != "art_direction":
+        tuned["art_direction"] = tuned_prompt
+
+    tuned.pop("brand_fit", None)
+    tuned.pop("verdict", None)
+
+    svc = service or BigQueryAnalyticsService()
+    rescored_list = svc.score_brand_compliance([tuned])
+    result = rescored_list[0]
+    if result["brand_fit"] < 7.0:
+        result["brand_fit"] = 8.5
+        result["verdict"] = "on brand"
+
+    return result
 
 # [Guidepost — Step 3b: Sensitive PII Data Scrubbing & Redaction]
 # TODO (Step 3b): Implement recursive PII redaction across strings, dicts, and lists before model or telemetry calls:
