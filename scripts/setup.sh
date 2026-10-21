@@ -59,16 +59,14 @@ ensure_bucket() {
     run_cmd gcloud storage buckets create "gs://${LOGS_BUCKET_NAME}" \
       --project="${GOOGLE_CLOUD_PROJECT}" \
       --location="${GOOGLE_CLOUD_REGION}" \
-      --uniform-bucket-level-access \
-      --versioning
+      --uniform-bucket-level-access
     return 0
   fi
   if ! gcloud storage buckets describe "gs://${LOGS_BUCKET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null 2>&1; then
     gcloud storage buckets create "gs://${LOGS_BUCKET_NAME}" \
       --project="${GOOGLE_CLOUD_PROJECT}" \
       --location="${GOOGLE_CLOUD_REGION}" \
-      --uniform-bucket-level-access \
-      --versioning
+      --uniform-bucket-level-access
   fi
 }
 
